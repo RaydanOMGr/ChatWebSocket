@@ -2,17 +2,12 @@ package me.andreasmelone.chatsocket;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonParseException;
-import com.google.gson.JsonSyntaxException;
 import io.javalin.Javalin;
 import io.javalin.websocket.WsContext;
-import me.andreasmelone.chatsocket.models.BasicModel;
-import me.andreasmelone.chatsocket.models.IDAssignModel;
-import me.andreasmelone.chatsocket.models.MessageModel;
-import me.andreasmelone.chatsocket.models.RegisterUsernameModel;
+import me.andreasmelone.chatsocket.models.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
 import java.util.*;
 
 public class ChatSocket {
@@ -31,6 +26,7 @@ public class ChatSocket {
         models.register(0, MessageModel.class);
         models.register(1, IDAssignModel.class);
         models.register(2, RegisterUsernameModel.class);
+        models.register(3, KeepAliveModel.class);
 
         Javalin app = Javalin.create(
                 config -> {
@@ -48,6 +44,25 @@ public class ChatSocket {
                 UUID sessionUUID = UUID.randomUUID();
                 sessions.put(sessionUUID, client);
                 models.send(client, new IDAssignModel(sessionUUID));
+                new Thread(() -> {
+                    while(sessions.containsKey(sessionUUID) && sessions.get(sessionUUID).session.isOpen()) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+
+                        models.send(client, new KeepAliveModel());
+                        users.get(sessionUUID).missingResponses++;
+
+                        if (users.get(sessionUUID).missingResponses > 5) {
+                            sessions.get(sessionUUID).session.close();
+                            sessions.remove(sessionUUID);
+                            users.remove(sessionUUID);
+                            logger.info("[{}] Disconnected (timeout)", client.session.getRemoteAddress());
+                        }
+                    }
+                }).start();
             });
             ws.onMessage(client -> {
                 try {
@@ -78,6 +93,15 @@ public class ChatSocket {
                         });
                         logger.info("[{}] {}", client.session.getRemoteAddress(), msg);
                     }
+                    else if(models.get(message.id) == KeepAliveModel.class) {
+                        KeepAliveModel keepAliveModel = gson.fromJson(client.message(), KeepAliveModel.class);
+                        if(!users.containsKey(keepAliveModel.getSessionUUID())) {
+                            return;
+                        }
+                        User user = users.get(keepAliveModel.getSessionUUID());
+                        user.missingResponses = 0;
+                        logger.info("[{}] Keep alive", client.session.getRemoteAddress());
+                    }
                 } catch(JsonParseException e) {
                     logger.error("[{}] Invalid JSON: {}", client.session.getRemoteAddress(), client.message());
                     e.printStackTrace();
@@ -87,7 +111,21 @@ public class ChatSocket {
 
             ws.onClose(client -> {
                 logger.info("[{}] Disconnected", client.session.getRemoteAddress());
-                sessions.remove(client);
+                UUID thisUUID = null;
+                for(Map.Entry<UUID, WsContext> entry : sessions.entrySet()) {
+                    if(entry.getValue() == client) {
+                        thisUUID = entry.getKey();
+                        sessions.remove(entry.getKey());
+                        break;
+                    }
+                }
+                if(thisUUID == null) {
+                    return;
+                }
+                if(!users.containsKey(thisUUID)) {
+                    return;
+                }
+                users.remove(thisUUID);
             });
         });
     }
